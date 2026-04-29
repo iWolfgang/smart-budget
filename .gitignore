@@ -1,0 +1,25 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Local backups / exports the user might create
+*.bak
+funds-hub-*.json
+transactions-*.csv
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment / secrets (none needed by this app, but in case)
+.env
+.env.local
