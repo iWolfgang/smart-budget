@@ -1487,18 +1487,27 @@ async function loginWithPassword(username, password){
   const localAuth = authMeta();
   const localMatches = localAuth && localAuth.username === username;
 
-  // Decide salt source: server (preferred) → local fallback if offline
-  let saltB64, iter, fromServer = false;
+  // Decide salt source: server (preferred) → local fallback if offline.
+  // If the server says 404 but we have a matching local account, treat this
+  // as a one-time migration: re-use the local salt so the existing vault
+  // stays decryptable, then upload it to the cloud after we verify the password.
+  let saltB64, iter, fromServer = false, migrating = false;
   try{
     const r = await apiFetch('/account/' + encodeURIComponent(username), { method:'GET' });
     if(r.ok){ saltB64 = r.body.salt; iter = r.body.iter || KDF_ITERATIONS; fromServer = true; }
     else if(r.status === 404){
-      throw new Error('No account with that username — Create account?');
+      if(localMatches){
+        saltB64 = localAuth.salt;
+        iter = localAuth.iter || KDF_ITERATIONS;
+        migrating = true;
+      } else {
+        throw new Error('No account with that username — Create account?');
+      }
     } else {
       throw new Error(r.body.error || ('HTTP '+r.status));
     }
   }catch(e){
-    if(e.message && e.message.startsWith('No account')) throw e;
+    if(e.message && (e.message.startsWith('No account') || migrating)) throw e;
     if(localMatches){
       saltB64 = localAuth.salt;
       iter = localAuth.iter || KDF_ITERATIONS;
@@ -1529,6 +1538,27 @@ async function loginWithPassword(username, password){
       throw new Error(r.body.error || ('Login failed (HTTP '+r.status+')'));
     }
     serverVault = r.body.encryptedVault || null;
+  } else if(migrating){
+    // Local-only account → upload current vault to the cloud using the same salt
+    const rawVault = localStorage.getItem(VAULT_KEY);
+    let payload = rawVault ? JSON.parse(rawVault) : await encryptJSON(encKey, freshState());
+    // Re-encrypt to a fresh blob (in case the on-disk shape predates v2)
+    const decrypted = rawVault ? await decryptJSON(encKey, payload).catch(()=>null) : freshState();
+    if(!decrypted) throw new Error('Incorrect password');
+    payload = await encryptJSON(encKey, decrypted);
+    const r = await apiFetch('/signup', {
+      method:'POST',
+      headers:{ 'content-type':'application/json' },
+      body: JSON.stringify({
+        username, salt: saltB64, iter, authTokenHash, encryptedVault: payload
+      })
+    });
+    if(!r.ok){
+      if(r.status === 409) throw new Error('Username got taken just now — try a different one or wipe & recreate');
+      throw new Error(r.body.error || ('Migration failed (HTTP '+r.status+')'));
+    }
+    serverVault = payload;
+    toast('Synced your account to the cloud');
   }
 
   // Decrypt whichever vault we have
