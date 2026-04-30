@@ -202,6 +202,10 @@
   .auth-strength.s3 > div:nth-child(-n+3){background:#eab308}
   .auth-strength.s4 > div{background:var(--accent-2)}
   .auth-foot{font-size:11px;color:var(--muted);text-align:center;margin-top:14px;line-height:1.5}
+  .auth-tabs{display:flex;gap:4px;background:var(--tip-bg);border:1px solid var(--border);border-radius:10px;padding:4px;margin-bottom:18px}
+  .auth-tab{flex:1;background:transparent;border:none;padding:8px 10px;font-size:13px;font-weight:600;color:var(--muted);border-radius:7px;cursor:pointer;transition:.15s;font-family:inherit}
+  .auth-tab:hover{color:var(--text)}
+  .auth-tab.active{background:var(--panel);color:var(--text);box-shadow:0 1px 2px rgba(0,0,0,.06)}
   .pw-toggle{position:relative}
   .pw-toggle input{padding-right:42px}
   .pw-toggle button{position:absolute;right:4px;top:50%;transform:translateY(-50%);background:transparent;border:none;color:var(--muted);cursor:pointer;padding:6px;border-radius:6px;display:inline-flex;align-items:center;justify-content:center;transition:color .15s, background .15s}
@@ -231,6 +235,10 @@
 <div id="auth-screen" class="auth-screen">
   <div class="auth-card">
     <div class="brand-logo" style="width:44px;height:44px;font-size:18px">¥</div>
+    <div class="auth-tabs hide" id="auth-tabs" role="tablist">
+      <button type="button" class="auth-tab active" data-mode="login" role="tab">Sign in</button>
+      <button type="button" class="auth-tab" data-mode="setup" role="tab">Create account</button>
+    </div>
     <h2 id="auth-title">Welcome back</h2>
     <div class="auth-sub" id="auth-sub">Sign in to access your startup funds hub</div>
     <form id="auth-form" autocomplete="on">
@@ -286,7 +294,7 @@
       <div class="account-avatar" id="account-avatar">·</div>
       <div class="account-info">
         <div class="account-name" id="account-name">—</div>
-        <div class="account-status">Signed in · encrypted</div>
+        <div class="account-status" id="account-status">Signed in · synced</div>
       </div>
       <button class="icon-btn" id="btn-signout" title="Sign out">⎋</button>
     </div>
@@ -614,7 +622,15 @@ const THEME_KEY = 'SFH_THEME_v1';
 
 // Cryptographic key derived from the user's password; held only in memory after unlock
 let cryptoKey = null;
+// Bearer credential for the cloud sync API; in memory only, derived from password
+let sessionAuthToken = null;
 let saveQueue = Promise.resolve(); // serialize encryption writes
+let lastSyncedCipher = null;       // remembers last ciphertext we pushed, to skip no-op syncs
+let pendingSyncTimer = null;       // debounced server push
+
+// Cloud sync API. Override at runtime by setting window.SFH_API_BASE before this script.
+const API_BASE = (typeof window !== 'undefined' && window.SFH_API_BASE)
+  || 'https://smart-budget-api.wolfgangaston.workers.dev/api';
 
 function freshState(){
   return {
@@ -641,9 +657,49 @@ function saveState(){
     try{
       const payload = await encryptJSON(cryptoKey, snapshot);
       localStorage.setItem(VAULT_KEY, JSON.stringify(payload));
+      scheduleCloudSync();
     }catch(err){ console.error('vault write failed', err); toast('Could not save: '+err.message); }
   });
   return saveQueue;
+}
+
+function scheduleCloudSync(){
+  if(!sessionAuthToken) return;       // not signed in
+  if(pendingSyncTimer) clearTimeout(pendingSyncTimer);
+  pendingSyncTimer = setTimeout(()=>{ pendingSyncTimer = null; cloudSyncNow().catch(()=>{}); }, 700);
+}
+async function cloudSyncNow(){
+  if(!sessionAuthToken) return;
+  const auth = authMeta();
+  if(!auth || !auth.username) return;
+  const raw = localStorage.getItem(VAULT_KEY);
+  if(!raw) return;
+  if(raw === lastSyncedCipher) return;
+  let payload;
+  try{ payload = JSON.parse(raw); }catch{ return; }
+  try{
+    const r = await fetch(API_BASE + '/vault/' + encodeURIComponent(auth.username), {
+      method:'PUT',
+      headers:{ 'content-type':'application/json', 'authorization':'Bearer '+sessionAuthToken },
+      body: JSON.stringify({ encryptedVault:{ iv:payload.iv, ct:payload.ct } })
+    });
+    if(!r.ok){
+      const err = await r.json().catch(()=>({}));
+      throw new Error(err.error || ('HTTP '+r.status));
+    }
+    lastSyncedCipher = raw;
+    setSyncStatus('synced');
+  }catch(e){
+    console.warn('cloud sync failed', e);
+    setSyncStatus('offline');
+  }
+}
+function setSyncStatus(state){
+  const el = document.getElementById('account-status');
+  if(!el) return;
+  if(state==='syncing') el.textContent = 'Signed in · syncing…';
+  else if(state==='offline') el.textContent = 'Signed in · offline';
+  else el.textContent = 'Signed in · synced';
 }
 function uid(){ return 't_' + Math.random().toString(36).slice(2,10) + Date.now().toString(36).slice(-3); }
 
@@ -1260,17 +1316,29 @@ function b64e(buf){
   return btoa(s);
 }
 function b64d(s){ return Uint8Array.from(atob(s), c=>c.charCodeAt(0)); }
-async function deriveKey(password, saltBytes, iterations=KDF_ITERATIONS){
+async function sha256Hex(input){
+  const bytes = typeof input === 'string' ? new TextEncoder().encode(input) : input;
+  const buf = await crypto.subtle.digest('SHA-256', bytes);
+  return [...new Uint8Array(buf)].map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+// Single PBKDF2 derivation → 64 bytes; first 32 = AES-GCM key, last 32 = bearer auth token (base64).
+async function deriveKeys(password, saltBytes, iterations=KDF_ITERATIONS){
   const baseKey = await crypto.subtle.importKey(
     'raw', new TextEncoder().encode(password),
-    { name:'PBKDF2' }, false, ['deriveKey']
+    { name:'PBKDF2' }, false, ['deriveBits']
   );
-  return crypto.subtle.deriveKey(
+  const bits = await crypto.subtle.deriveBits(
     { name:'PBKDF2', salt: saltBytes, iterations, hash:'SHA-256' },
-    baseKey,
-    { name:'AES-GCM', length:256 },
-    false, ['encrypt','decrypt']
+    baseKey, 512
   );
+  const all = new Uint8Array(bits);
+  const encBytes = all.slice(0, 32);
+  const authBytes = all.slice(32, 64);
+  const encKey = await crypto.subtle.importKey('raw', encBytes,
+    { name:'AES-GCM' }, false, ['encrypt','decrypt']);
+  const authTokenB64 = b64e(authBytes);
+  const authTokenHash = await sha256Hex(authTokenB64);
+  return { encKey, authTokenB64, authTokenHash };
 }
 async function encryptJSON(key, obj){
   const iv = crypto.getRandomValues(new Uint8Array(12));
@@ -1303,36 +1371,46 @@ function pwStrength(p){
   if(/[0-9]/.test(p) && /[^A-Za-z0-9]/.test(p)) s++;
   return s; // 0..4
 }
+let currentAuthMode = 'login'; // 'login' | 'setup'
 function configureAuthUI(mode){
-  // mode = 'login' | 'setup'
+  currentAuthMode = mode;
   const auth = authMeta();
+  // Highlight the active tab
+  document.querySelectorAll('#auth-tabs .auth-tab').forEach(t=>{
+    t.classList.toggle('active', t.dataset.mode === mode);
+  });
   if(mode==='setup'){
     document.getElementById('auth-title').textContent = 'Create your account';
-    document.getElementById('auth-sub').textContent = 'Set a username and password to encrypt your funds data.';
+    document.getElementById('auth-sub').textContent = 'Pick a username and password. Your data syncs to the cloud, end-to-end encrypted.';
     document.getElementById('auth-confirm-wrap').classList.remove('hide');
     document.getElementById('pw-strength').classList.remove('hide');
     document.getElementById('auth-pass').setAttribute('autocomplete','new-password');
     document.getElementById('auth-submit').textContent = 'Create account';
-    document.getElementById('auth-foot').innerHTML = 'Your data is encrypted in this browser with AES-256-GCM. <br>If you forget your password, the data <b>cannot</b> be recovered.';
+    document.getElementById('auth-foot').innerHTML = 'AES-256-GCM client-side. The server only stores ciphertext. <br>If you forget your password, the data <b>cannot</b> be recovered.';
   } else {
     document.getElementById('auth-title').textContent = 'Welcome back';
-    document.getElementById('auth-sub').textContent = 'Sign in to access your startup funds hub';
+    document.getElementById('auth-sub').textContent = 'Sign in from any device with your username and password.';
     document.getElementById('auth-confirm-wrap').classList.add('hide');
     document.getElementById('pw-strength').classList.add('hide');
     document.getElementById('auth-pass').setAttribute('autocomplete','current-password');
     document.getElementById('auth-submit').textContent = 'Sign in';
-    document.getElementById('auth-foot').innerHTML = 'Encrypted with AES-256-GCM. <br>If you forget your password, the data cannot be recovered.';
-    if(auth && auth.username) document.getElementById('auth-user').value = auth.username;
+    document.getElementById('auth-foot').innerHTML = 'Client-side AES-256-GCM. The server only stores ciphertext.';
+    if(auth && auth.username && !document.getElementById('auth-user').value){
+      document.getElementById('auth-user').value = auth.username;
+    }
   }
   setAuthError('');
 }
 function showAuthScreen(mode){
   document.getElementById('app-root').style.display = 'none';
   document.getElementById('auth-screen').style.display = 'flex';
+  // Show mode tabs only when this device has no local account (i.e. first sign-in or fresh device)
+  const tabs = document.getElementById('auth-tabs');
+  if(authMeta()) tabs.classList.add('hide');
+  else tabs.classList.remove('hide');
   configureAuthUI(mode);
   setTimeout(()=>{
-    const auth = authMeta();
-    if(auth && document.getElementById('auth-user').value){
+    if(document.getElementById('auth-user').value){
       document.getElementById('auth-pass').focus();
     } else {
       document.getElementById('auth-user').focus();
@@ -1344,21 +1422,22 @@ function hideAuthScreen(){
   document.getElementById('app-root').style.display = '';
 }
 
+async function apiFetch(path, opts){
+  const r = await fetch(API_BASE + path, opts);
+  let body = null;
+  try { body = await r.json(); } catch {}
+  return { ok: r.ok, status: r.status, body: body || {} };
+}
+
+function normalizeUsername(u){ return String(u||'').trim().toLowerCase(); }
+function isValidUsername(u){ return /^[a-zA-Z0-9._-]{2,64}$/.test(u); }
+
 async function setupAccount(username, password){
+  username = normalizeUsername(username);
+  if(!isValidUsername(username)) throw new Error('Username must be 2–64 chars (letters, digits, . _ -)');
   const salt = crypto.getRandomValues(new Uint8Array(16));
-  const key = await deriveKey(password, salt);
-  // Verify token: encrypt a sentinel; decryption success on login = correct password
-  const verify = await encryptJSON(key, { ok:true, ts:Date.now() });
-  const auth = {
-    username,
-    salt: b64e(salt),
-    iter: KDF_ITERATIONS,
-    verify,
-    createdAt: Date.now(),
-    v: 1
-  };
-  localStorage.setItem(AUTH_KEY, JSON.stringify(auth));
-  cryptoKey = key;
+  const saltB64 = b64e(salt);
+  const { encKey, authTokenB64, authTokenHash } = await deriveKeys(password, salt);
 
   // Migrate any pre-existing plaintext state from the older version
   let migrated = null;
@@ -1372,31 +1451,98 @@ async function setupAccount(username, password){
       if(!migrated.settings) migrated.settings = { currency:'CNY', company:'', theme:'system' };
     }
   }catch{}
+  const initialState = migrated || freshState();
+  const encryptedVault = await encryptJSON(encKey, initialState);
 
-  state = migrated || freshState();
-  await saveState();
+  const res = await apiFetch('/signup', {
+    method:'POST',
+    headers:{ 'content-type':'application/json' },
+    body: JSON.stringify({
+      username, salt: saltB64, iter: KDF_ITERATIONS, authTokenHash, encryptedVault
+    })
+  });
+  if(!res.ok){
+    if(res.status === 409) throw new Error('That username is already taken');
+    throw new Error(res.body.error || ('Sign up failed (HTTP '+res.status+')'));
+  }
 
-  // Wipe the legacy plaintext copy now that an encrypted vault exists
+  // Cache locally for fast subsequent loads
+  const verify = await encryptJSON(encKey, { ok:true, ts:Date.now() });
+  localStorage.setItem(AUTH_KEY, JSON.stringify({
+    username, salt: saltB64, iter: KDF_ITERATIONS, verify, createdAt: Date.now(), v: 2
+  }));
+  localStorage.setItem(VAULT_KEY, JSON.stringify(encryptedVault));
+  lastSyncedCipher = localStorage.getItem(VAULT_KEY);
+
+  cryptoKey = encKey;
+  sessionAuthToken = authTokenB64;
+  state = initialState;
+
   localStorage.removeItem(LEGACY_STATE_KEY);
 }
 
 async function loginWithPassword(username, password){
-  const auth = authMeta();
-  if(!auth) throw new Error('No account on this device');
-  if(auth.username !== username) throw new Error('Username does not match');
-  const salt = b64d(auth.salt);
-  const key = await deriveKey(password, salt, auth.iter || KDF_ITERATIONS);
-  // Try to decrypt the verify token to confirm password
-  try { await decryptJSON(key, auth.verify); }
-  catch { throw new Error('Incorrect password'); }
-  cryptoKey = key;
-  // Load and decrypt vault if present
-  const rawVault = localStorage.getItem(VAULT_KEY);
-  if(rawVault){
+  username = normalizeUsername(username);
+  if(!isValidUsername(username)) throw new Error('Username must be 2–64 chars (letters, digits, . _ -)');
+  const localAuth = authMeta();
+  const localMatches = localAuth && localAuth.username === username;
+
+  // Decide salt source: server (preferred) → local fallback if offline
+  let saltB64, iter, fromServer = false;
+  try{
+    const r = await apiFetch('/account/' + encodeURIComponent(username), { method:'GET' });
+    if(r.ok){ saltB64 = r.body.salt; iter = r.body.iter || KDF_ITERATIONS; fromServer = true; }
+    else if(r.status === 404){
+      throw new Error('No account with that username — Create account?');
+    } else {
+      throw new Error(r.body.error || ('HTTP '+r.status));
+    }
+  }catch(e){
+    if(e.message && e.message.startsWith('No account')) throw e;
+    if(localMatches){
+      saltB64 = localAuth.salt;
+      iter = localAuth.iter || KDF_ITERATIONS;
+    } else {
+      throw new Error('Cannot reach server — check your connection');
+    }
+  }
+
+  const salt = b64d(saltB64);
+  const { encKey, authTokenB64, authTokenHash } = await deriveKeys(password, salt, iter);
+
+  // If we have a verify token cached locally for this account, fast-check the password
+  if(localMatches && localAuth.verify){
+    try { await decryptJSON(encKey, localAuth.verify); }
+    catch { throw new Error('Incorrect password'); }
+  }
+
+  // Server login: confirms credential + returns latest vault
+  let serverVault = null;
+  if(fromServer){
+    const r = await apiFetch('/login', {
+      method:'POST',
+      headers:{ 'content-type':'application/json' },
+      body: JSON.stringify({ username, authTokenHash })
+    });
+    if(!r.ok){
+      if(r.status === 401) throw new Error('Incorrect password');
+      throw new Error(r.body.error || ('Login failed (HTTP '+r.status+')'));
+    }
+    serverVault = r.body.encryptedVault || null;
+  }
+
+  // Decrypt whichever vault we have
+  let payload = null;
+  if(serverVault){
+    payload = serverVault;
+    localStorage.setItem(VAULT_KEY, JSON.stringify({ iv:payload.iv, ct:payload.ct, v:1 }));
+  } else {
+    const rawVault = localStorage.getItem(VAULT_KEY);
+    if(rawVault) { try{ payload = JSON.parse(rawVault); }catch{} }
+  }
+  if(payload){
     try{
-      const payload = JSON.parse(rawVault);
-      const decrypted = await decryptJSON(key, payload);
-      // Re-hydrate state, filling in missing fields from defaults
+      const decrypted = await decryptJSON(encKey, payload);
       const def = freshState();
       state = Object.assign(def, decrypted);
       if(!state.categories || !state.categories.length) state.categories = [...DEFAULT_CATEGORIES];
@@ -1406,51 +1552,97 @@ async function loginWithPassword(username, password){
       if(!state.settings.theme) state.settings.theme = localStorage.getItem(THEME_KEY) || 'system';
     }catch(e){
       console.error('vault decrypt failed', e);
-      throw new Error('Vault decryption failed — your data may be corrupted');
+      throw new Error('Vault decryption failed — wrong password or corrupted data');
     }
   } else {
     state = freshState();
   }
+
+  // Cache auth meta locally (with verify token) for offline fast-path next time
+  const verify = await encryptJSON(encKey, { ok:true, ts:Date.now() });
+  localStorage.setItem(AUTH_KEY, JSON.stringify({
+    username, salt: saltB64, iter, verify,
+    createdAt: localAuth?.createdAt || Date.now(), v: 2
+  }));
+  lastSyncedCipher = localStorage.getItem(VAULT_KEY);
+
+  cryptoKey = encKey;
+  sessionAuthToken = authTokenB64;
 }
 
 async function changePassword(currentPw, newPw){
   const auth = authMeta();
   if(!auth) throw new Error('No account');
-  // Verify current password
-  const oldKey = await deriveKey(currentPw, b64d(auth.salt), auth.iter || KDF_ITERATIONS);
-  try { await decryptJSON(oldKey, auth.verify); }
+  // Verify current password locally
+  const oldSalt = b64d(auth.salt);
+  const oldDerived = await deriveKeys(currentPw, oldSalt, auth.iter || KDF_ITERATIONS);
+  try { await decryptJSON(oldDerived.encKey, auth.verify); }
   catch { throw new Error('Current password is incorrect'); }
-  // Derive new key with a new salt
+
+  // Derive new keys with fresh salt and re-encrypt the current state
   const salt = crypto.getRandomValues(new Uint8Array(16));
-  const newKey = await deriveKey(newPw, salt);
-  const verify = await encryptJSON(newKey, { ok:true, ts:Date.now() });
-  // Re-encrypt vault under new key (state is already in memory)
-  cryptoKey = newKey;
-  await saveState();
-  const newAuth = { ...auth, salt:b64e(salt), iter:KDF_ITERATIONS, verify, rotatedAt:Date.now() };
-  localStorage.setItem(AUTH_KEY, JSON.stringify(newAuth));
+  const saltB64 = b64e(salt);
+  const newDerived = await deriveKeys(newPw, salt);
+  const newEncryptedVault = await encryptJSON(newDerived.encKey, JSON.parse(JSON.stringify(state)));
+
+  // Push rotation to the server using OLD bearer token
+  const oldToken = sessionAuthToken || oldDerived.authTokenB64;
+  const r = await apiFetch('/rotate', {
+    method:'POST',
+    headers:{ 'content-type':'application/json', 'authorization':'Bearer '+oldToken },
+    body: JSON.stringify({
+      username: auth.username, salt: saltB64, iter: KDF_ITERATIONS,
+      authTokenHash: newDerived.authTokenHash, encryptedVault: newEncryptedVault
+    })
+  });
+  if(!r.ok){
+    if(r.status === 401) throw new Error('Server rejected the password change');
+    throw new Error(r.body.error || ('Rotate failed (HTTP '+r.status+')'));
+  }
+
+  // Adopt new keys locally
+  cryptoKey = newDerived.encKey;
+  sessionAuthToken = newDerived.authTokenB64;
+  const verify = await encryptJSON(newDerived.encKey, { ok:true, ts:Date.now() });
+  localStorage.setItem(AUTH_KEY, JSON.stringify({
+    ...auth, salt: saltB64, iter: KDF_ITERATIONS, verify, rotatedAt: Date.now(), v: 2
+  }));
+  localStorage.setItem(VAULT_KEY, JSON.stringify(newEncryptedVault));
+  lastSyncedCipher = localStorage.getItem(VAULT_KEY);
 }
 
 function signOut(){
   cryptoKey = null;
+  sessionAuthToken = null;
+  if(pendingSyncTimer){ clearTimeout(pendingSyncTimer); pendingSyncTimer = null; }
   state = freshState();
-  // Clear sensitive form fields
   ['auth-pass','auth-pass2','cp-current','cp-new','cp-new2'].forEach(id=>{ const e=document.getElementById(id); if(e) e.value=''; });
-  // Tear down charts so they re-create cleanly on next login
   Object.keys(charts).forEach(k=>destroyChart(k));
   showAuthScreen('login');
 }
 
-function forgetAccount(){
-  if(!confirm('FORGET ACCOUNT will erase your password AND all encrypted data. This cannot be undone. Continue?')) return;
-  if(!confirm('Last chance — type confirm in your head and click OK to wipe everything.')) return;
+async function forgetAccount(){
+  if(!confirm('FORGET ACCOUNT will erase your password AND all encrypted data — both on this device and on the server. This cannot be undone. Continue?')) return;
+  if(!confirm('Last chance — click OK to wipe everything everywhere.')) return;
+  const auth = authMeta();
+  // Best-effort server delete; ignore failures so the local wipe still happens
+  if(auth && auth.username && sessionAuthToken){
+    try{
+      await apiFetch('/account/' + encodeURIComponent(auth.username), {
+        method:'DELETE',
+        headers:{ 'authorization':'Bearer '+sessionAuthToken }
+      });
+    }catch(e){ console.warn('server delete failed', e); }
+  }
   localStorage.removeItem(AUTH_KEY);
   localStorage.removeItem(VAULT_KEY);
   localStorage.removeItem(LEGACY_STATE_KEY);
   cryptoKey = null;
+  sessionAuthToken = null;
+  lastSyncedCipher = null;
   state = freshState();
   Object.keys(charts).forEach(k=>destroyChart(k));
-  showAuthScreen('setup');
+  showAuthScreen('login');
   toast('Account wiped');
 }
 
@@ -1460,7 +1652,7 @@ document.getElementById('auth-form').addEventListener('submit', async (e)=>{
   const username = document.getElementById('auth-user').value.trim();
   const password = document.getElementById('auth-pass').value;
   const confirmPw = document.getElementById('auth-pass2').value;
-  const isSetup = !authMeta();
+  const isSetup = currentAuthMode === 'setup';
   setAuthError('');
   const submitBtn = document.getElementById('auth-submit');
   submitBtn.disabled = true; submitBtn.textContent = isSetup ? 'Creating…' : 'Signing in…';
@@ -1486,11 +1678,24 @@ document.getElementById('auth-form').addEventListener('submit', async (e)=>{
 
 // Password strength meter (only meaningful in setup mode)
 document.getElementById('auth-pass').addEventListener('input', (e)=>{
-  if(authMeta()) return; // login mode
+  if(currentAuthMode !== 'setup') return;
   const meter = document.getElementById('pw-strength');
   meter.classList.remove('s1','s2','s3','s4');
   const s = pwStrength(e.target.value);
   if(s>0) meter.classList.add('s'+Math.min(4,s));
+});
+
+// Auth mode tabs
+document.querySelectorAll('#auth-tabs .auth-tab').forEach(tab=>{
+  tab.addEventListener('click', ()=>{
+    const mode = tab.dataset.mode;
+    if(mode === currentAuthMode) return;
+    configureAuthUI(mode);
+    document.getElementById('auth-pass').value = '';
+    document.getElementById('auth-pass2').value = '';
+    document.getElementById('pw-strength').classList.remove('s1','s2','s3','s4');
+    document.getElementById('auth-pass').focus();
+  });
 });
 
 // Show/hide password
@@ -1554,6 +1759,7 @@ function afterUnlock(){
     const setUserEl = document.getElementById('set-username');
     if(setUserEl) setUserEl.textContent = auth.username;
   }
+  setSyncStatus('synced');
   // Sync the pre-login theme key with the value stored inside the (now-decrypted) vault
   if(state.settings && state.settings.theme){
     localStorage.setItem(THEME_KEY, state.settings.theme);
@@ -1566,8 +1772,9 @@ function afterUnlock(){
 (function boot(){
   // Apply pre-login theme so the auth screen matches the user's preference / OS
   applyTheme();
-  // Decide which auth mode to show
-  showAuthScreen(authMeta() ? 'login' : 'setup');
+  // Always start in 'login' mode. If no local account, the tabs are visible so
+  // the user can switch to "Create account".
+  showAuthScreen('login');
 })();
 </script>
 </body>
