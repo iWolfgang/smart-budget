@@ -305,8 +305,9 @@
   </div>
 </noscript>
 
-<!-- Auth screen overlay (shown before unlock) -->
-<div id="auth-screen" class="auth-screen">
+<!-- Auth screen overlay (shown before unlock; hidden by default so the boot
+     code can decide whether to restore a persisted session before painting) -->
+<div id="auth-screen" class="auth-screen" style="display:none">
   <div class="auth-card">
     <div class="brand-logo" style="width:44px;height:44px;font-size:18px">¥</div>
     <div class="auth-tabs hide" id="auth-tabs" role="tablist">
@@ -1412,6 +1413,59 @@ if(systemMQ){
   else if(systemMQ.addListener) systemMQ.addListener(onSysChange); // older Safari
 }
 
+/* ============== Persistent session (IndexedDB) ============== */
+// We stash the derived encryption key (non-extractable CryptoKey) and the
+// bearer auth token in IndexedDB so the user stays signed in across reloads.
+// CryptoKeys are bound to this origin and cannot be exported as raw bytes.
+const IDB_NAME = 'sfh';
+const IDB_STORE = 'kv';
+const SESSION_KEY = 'session';
+function idbOpen(){
+  return new Promise((resolve, reject)=>{
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = ()=>{ req.result.createObjectStore(IDB_STORE); };
+    req.onsuccess = ()=>resolve(req.result);
+    req.onerror = ()=>reject(req.error);
+  });
+}
+async function idbPut(key, value){
+  const db = await idbOpen();
+  return new Promise((resolve, reject)=>{
+    const tx = db.transaction(IDB_STORE, 'readwrite');
+    tx.objectStore(IDB_STORE).put(value, key);
+    tx.oncomplete = ()=>resolve();
+    tx.onerror = ()=>reject(tx.error);
+  });
+}
+async function idbGet(key){
+  const db = await idbOpen();
+  return new Promise((resolve, reject)=>{
+    const tx = db.transaction(IDB_STORE, 'readonly');
+    const r = tx.objectStore(IDB_STORE).get(key);
+    r.onsuccess = ()=>resolve(r.result);
+    r.onerror = ()=>reject(r.error);
+  });
+}
+async function idbDel(key){
+  const db = await idbOpen();
+  return new Promise((resolve, reject)=>{
+    const tx = db.transaction(IDB_STORE, 'readwrite');
+    tx.objectStore(IDB_STORE).delete(key);
+    tx.oncomplete = ()=>resolve();
+    tx.onerror = ()=>reject(tx.error);
+  });
+}
+async function saveSession(username, encKey, authToken){
+  try{ await idbPut(SESSION_KEY, { username, encKey, authToken, savedAt: Date.now() }); }
+  catch(e){ console.warn('idb session save failed', e); }
+}
+async function loadSession(){
+  try{ return await idbGet(SESSION_KEY); }catch{ return null; }
+}
+async function clearSession(){
+  try{ await idbDel(SESSION_KEY); }catch{}
+}
+
 /* ============== Crypto helpers ============== */
 const KDF_ITERATIONS = 200000;
 function b64e(buf){
@@ -1584,6 +1638,7 @@ async function setupAccount(username, password){
   state = initialState;
 
   localStorage.removeItem(LEGACY_STATE_KEY);
+  await saveSession(username, encKey, authTokenB64);
 }
 
 async function loginWithPassword(username, password){
@@ -1703,6 +1758,7 @@ async function loginWithPassword(username, password){
 
   cryptoKey = encKey;
   sessionAuthToken = authTokenB64;
+  await saveSession(username, encKey, authTokenB64);
 }
 
 async function changePassword(currentPw, newPw){
@@ -1738,6 +1794,7 @@ async function changePassword(currentPw, newPw){
   // Adopt new keys locally
   cryptoKey = newDerived.encKey;
   sessionAuthToken = newDerived.authTokenB64;
+  await saveSession(auth.username, newDerived.encKey, newDerived.authTokenB64);
   const verify = await encryptJSON(newDerived.encKey, { ok:true, ts:Date.now() });
   localStorage.setItem(AUTH_KEY, JSON.stringify({
     ...auth, salt: saltB64, iter: KDF_ITERATIONS, verify, rotatedAt: Date.now(), v: 2
@@ -1753,6 +1810,7 @@ function signOut(){
   state = freshState();
   ['auth-pass','auth-pass2','cp-current','cp-new','cp-new2'].forEach(id=>{ const e=document.getElementById(id); if(e) e.value=''; });
   Object.keys(charts).forEach(k=>destroyChart(k));
+  clearSession();
   showAuthScreen('login');
 }
 
@@ -1777,6 +1835,7 @@ async function forgetAccount(){
   lastSyncedCipher = null;
   state = freshState();
   Object.keys(charts).forEach(k=>destroyChart(k));
+  await clearSession();
   showAuthScreen('login');
   toast('Account wiped');
 }
@@ -1906,13 +1965,48 @@ function afterUnlock(){
   applyTheme(); // also re-renders dashboard
 }
 
+async function tryRestoreSession(){
+  try{
+    const sess = await loadSession();
+    if(!sess || !sess.username || !sess.encKey || !sess.authToken) return false;
+    const meta = authMeta();
+    if(!meta || meta.username !== sess.username) return false;
+    const rawVault = localStorage.getItem(VAULT_KEY);
+    if(!rawVault) return false;
+    let payload;
+    try{ payload = JSON.parse(rawVault); }catch{ return false; }
+    let decrypted;
+    try { decrypted = await decryptJSON(sess.encKey, payload); }
+    catch(e){
+      console.warn('persisted-key decrypt failed', e);
+      await clearSession();
+      return false;
+    }
+    const def = freshState();
+    state = Object.assign(def, decrypted);
+    if(!state.categories || !state.categories.length) state.categories = [...DEFAULT_CATEGORIES];
+    if(!state.transactions) state.transactions = [];
+    if(!state.budgets) state.budgets = {};
+    if(!state.settings) state.settings = def.settings;
+    if(!state.settings.theme) state.settings.theme = localStorage.getItem(THEME_KEY) || 'system';
+    cryptoKey = sess.encKey;
+    sessionAuthToken = sess.authToken;
+    lastSyncedCipher = rawVault;
+    return true;
+  }catch(e){
+    console.warn('session restore failed', e);
+    return false;
+  }
+}
+
 /* ============== Boot ============== */
-(function boot(){
-  // Apply pre-login theme so the auth screen matches the user's preference / OS
+(async function boot(){
+  // Apply pre-login theme so anything we paint matches the user's preference / OS
   applyTheme();
-  // Always start in 'login' mode. If no local account, the tabs are visible so
-  // the user can switch to "Create account".
-  showAuthScreen('login');
+  // Try to silently resume a previous session (encryption key cached in IndexedDB)
+  const restored = await tryRestoreSession();
+  if(restored) afterUnlock();
+  else showAuthScreen('login');
 })();
 </script>
 </body>
