@@ -17,7 +17,8 @@ function corsHeaders(req, env) {
   return {
     "Access-Control-Allow-Origin": allow,
     "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, If-None-Match",
+    "Access-Control-Expose-Headers": "ETag",
     "Access-Control-Max-Age": "86400",
     "Vary": "Origin",
   };
@@ -89,9 +90,10 @@ async function handle(req, env) {
       createdAt: Date.now(),
       v: 1,
     };
+    const ts = Date.now();
     await env.VAULT.put(`acct:${u}`, JSON.stringify(acct));
-    await env.VAULT.put(`vault:${u}`, JSON.stringify({ ...body.encryptedVault, updatedAt: Date.now() }));
-    return json({ ok: true }, 201);
+    await env.VAULT.put(`vault:${u}`, JSON.stringify({ ...body.encryptedVault, updatedAt: ts }));
+    return json({ ok: true, updatedAt: ts }, 201);
   }
 
   // POST /api/login  body: { username, authTokenHash } → { encryptedVault }
@@ -124,8 +126,31 @@ async function handle(req, env) {
     if (!body || !isValidVault(body.encryptedVault)) return json({ error: "invalid encryptedVault" }, 400);
     if (bytesOf(body.encryptedVault) > MAX_VAULT_BYTES) return json({ error: "vault too large" }, 413);
 
-    await env.VAULT.put(`vault:${u}`, JSON.stringify({ ...body.encryptedVault, updatedAt: Date.now() }));
-    return json({ ok: true });
+    const ts = Date.now();
+    await env.VAULT.put(`vault:${u}`, JSON.stringify({ ...body.encryptedVault, updatedAt: ts }));
+    return json({ ok: true, updatedAt: ts });
+  }
+
+  // GET /api/vault/:username  Authorization: Bearer <authToken>
+  // ETag = "<updatedAt>". Returns 304 when the client already has the latest.
+  if (req.method === "GET" && (mm = m(/^\/api\/vault\/([^/]+)$/))) {
+    const u = normUser(decodeURIComponent(mm[1]));
+    if (!USERNAME_RE.test(u)) return json({ error: "invalid username" }, 400);
+    const tok = bearer(req);
+    if (!tok) return json({ error: "missing token" }, 401);
+    const acct = await env.VAULT.get(`acct:${u}`, "json");
+    if (!acct) return json({ error: "not found" }, 404);
+    const tokHash = await sha256Hex(tok);
+    if (tokHash !== acct.authTokenHash) return json({ error: "invalid token" }, 401);
+    const vault = await env.VAULT.get(`vault:${u}`, "json");
+    if (!vault) return json({ encryptedVault: null });
+    const etag = `"${vault.updatedAt || 0}"`;
+    if (req.headers.get("If-None-Match") === etag) {
+      return new Response(null, { status: 304, headers: { ETag: etag, "Cache-Control": "no-store" } });
+    }
+    return json({
+      encryptedVault: { iv: vault.iv, ct: vault.ct, updatedAt: vault.updatedAt }
+    }, 200, { ETag: etag, "Cache-Control": "no-store" });
   }
 
   // POST /api/rotate  Authorization: Bearer <oldAuthToken>

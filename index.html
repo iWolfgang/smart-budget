@@ -728,6 +728,9 @@ let sessionAuthToken = null;
 let saveQueue = Promise.resolve(); // serialize encryption writes
 let lastSyncedCipher = null;       // remembers last ciphertext we pushed, to skip no-op syncs
 let pendingSyncTimer = null;       // debounced server push
+let lastKnownEtag = null;          // ETag of the vault we currently hold (for polling)
+let pollTimer = null;              // setInterval id for cross-device polling
+const POLL_INTERVAL_MS = 4000;     // how often to ping the server when tab is visible
 
 // Cloud sync API. Override at runtime by setting window.SFH_API_BASE before this script.
 const API_BASE = (typeof window !== 'undefined' && window.SFH_API_BASE)
@@ -779,6 +782,7 @@ async function cloudSyncNow(){
   let payload;
   try{ payload = JSON.parse(raw); }catch{ return; }
   try{
+    setSyncStatus('syncing');
     const r = await fetch(API_BASE + '/vault/' + encodeURIComponent(auth.username), {
       method:'PUT',
       headers:{ 'content-type':'application/json', 'authorization':'Bearer '+sessionAuthToken },
@@ -788,12 +792,70 @@ async function cloudSyncNow(){
       const err = await r.json().catch(()=>({}));
       throw new Error(err.error || ('HTTP '+r.status));
     }
+    const data = await r.json().catch(()=>({}));
+    if(data && data.updatedAt) lastKnownEtag = '"' + data.updatedAt + '"';
     lastSyncedCipher = raw;
     setSyncStatus('synced');
   }catch(e){
     console.warn('cloud sync failed', e);
     setSyncStatus('offline');
   }
+}
+
+/* ============== Cross-device sync (poll) ============== */
+async function pollVault(){
+  if(!sessionAuthToken || !cryptoKey) return;
+  if(pendingSyncTimer) return; // user has unsaved changes; let them save first
+  const auth = authMeta();
+  if(!auth || !auth.username) return;
+  try{
+    const headers = { 'authorization':'Bearer '+sessionAuthToken };
+    if(lastKnownEtag) headers['If-None-Match'] = lastKnownEtag;
+    const r = await fetch(API_BASE + '/vault/' + encodeURIComponent(auth.username), { headers });
+    if(r.status === 304){ setSyncStatus('synced'); return; }
+    if(!r.ok){ setSyncStatus('offline'); return; }
+    const body = await r.json();
+    const ev = body && body.encryptedVault;
+    if(!ev || !ev.iv || !ev.ct){ setSyncStatus('synced'); return; }
+    const newEtag = r.headers.get('ETag') || ('"' + (ev.updatedAt||0) + '"');
+    if(newEtag === lastKnownEtag){ setSyncStatus('synced'); return; }
+    // First poll after a session-restore may have a null lastKnownEtag even though
+    // the local cipher matches the server — short-circuit so we don't re-render.
+    const newCipher = JSON.stringify({ iv:ev.iv, ct:ev.ct, v:1 });
+    if(newCipher === localStorage.getItem(VAULT_KEY)){
+      lastKnownEtag = newEtag;
+      setSyncStatus('synced');
+      return;
+    }
+    // New data — decrypt with our cached key and apply
+    let decrypted;
+    try { decrypted = await decryptJSON(cryptoKey, { iv:ev.iv, ct:ev.ct }); }
+    catch(e){ console.warn('poll decrypt failed', e); return; }
+    const def = freshState();
+    state = Object.assign(def, decrypted);
+    if(!state.categories || !state.categories.length) state.categories = [...DEFAULT_CATEGORIES];
+    if(!state.transactions) state.transactions = [];
+    if(!state.budgets) state.budgets = {};
+    if(!state.settings) state.settings = def.settings;
+    if(!state.settings.theme) state.settings.theme = localStorage.getItem(THEME_KEY) || 'system';
+    localStorage.setItem(VAULT_KEY, JSON.stringify({ iv:ev.iv, ct:ev.ct, v:1 }));
+    lastSyncedCipher = localStorage.getItem(VAULT_KEY);
+    lastKnownEtag = newEtag;
+    setSyncStatus('synced');
+    // Re-render the visible tab so the user sees fresh data
+    const active = document.querySelector('.nav button.active, .mobile-tabbar button.active');
+    if(active && active.dataset.tab) switchTab(active.dataset.tab);
+  }catch(e){
+    console.warn('poll failed', e);
+    setSyncStatus('offline');
+  }
+}
+function startPolling(){
+  if(pollTimer) return;
+  pollTimer = setInterval(pollVault, POLL_INTERVAL_MS);
+}
+function stopPolling(){
+  if(pollTimer){ clearInterval(pollTimer); pollTimer = null; }
 }
 function setSyncStatus(state){
   const el = document.getElementById('account-status');
@@ -1624,6 +1686,7 @@ async function setupAccount(username, password){
     if(res.status === 409) throw new Error('That username is already taken');
     throw new Error(res.body.error || ('Sign up failed (HTTP '+res.status+')'));
   }
+  if(res.body && res.body.updatedAt) lastKnownEtag = '"' + res.body.updatedAt + '"';
 
   // Cache locally for fast subsequent loads
   const verify = await encryptJSON(encKey, { ok:true, ts:Date.now() });
@@ -1725,6 +1788,7 @@ async function loginWithPassword(username, password){
   let payload = null;
   if(serverVault){
     payload = serverVault;
+    if(payload.updatedAt) lastKnownEtag = '"' + payload.updatedAt + '"';
     localStorage.setItem(VAULT_KEY, JSON.stringify({ iv:payload.iv, ct:payload.ct, v:1 }));
   } else {
     const rawVault = localStorage.getItem(VAULT_KEY);
@@ -1806,6 +1870,8 @@ async function changePassword(currentPw, newPw){
 function signOut(){
   cryptoKey = null;
   sessionAuthToken = null;
+  lastKnownEtag = null;
+  stopPolling();
   if(pendingSyncTimer){ clearTimeout(pendingSyncTimer); pendingSyncTimer = null; }
   state = freshState();
   ['auth-pass','auth-pass2','cp-current','cp-new','cp-new2'].forEach(id=>{ const e=document.getElementById(id); if(e) e.value=''; });
@@ -1833,6 +1899,8 @@ async function forgetAccount(){
   cryptoKey = null;
   sessionAuthToken = null;
   lastSyncedCipher = null;
+  lastKnownEtag = null;
+  stopPolling();
   state = freshState();
   Object.keys(charts).forEach(k=>destroyChart(k));
   await clearSession();
@@ -1963,6 +2031,8 @@ function afterUnlock(){
   }
   document.querySelectorAll('.cur-sym').forEach(e=>e.textContent = curSym());
   applyTheme(); // also re-renders dashboard
+  // Kick off cross-device polling
+  if(document.visibilityState === 'visible'){ startPolling(); pollVault(); }
 }
 
 async function tryRestoreSession(){
@@ -1998,6 +2068,20 @@ async function tryRestoreSession(){
     return false;
   }
 }
+
+// Pause polling when the tab is hidden; immediate refresh + resume when it comes back.
+document.addEventListener('visibilitychange', ()=>{
+  if(document.visibilityState === 'visible'){
+    if(cryptoKey){ pollVault(); startPolling(); }
+  } else {
+    stopPolling();
+  }
+});
+window.addEventListener('focus', ()=>{ if(cryptoKey) pollVault(); });
+// One last quick push on tab close so the partner's open tab gets the update fast.
+window.addEventListener('pagehide', ()=>{
+  if(pendingSyncTimer){ clearTimeout(pendingSyncTimer); pendingSyncTimer = null; cloudSyncNow().catch(()=>{}); }
+});
 
 /* ============== Boot ============== */
 (async function boot(){
