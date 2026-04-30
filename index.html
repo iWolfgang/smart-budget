@@ -276,8 +276,9 @@
     .auth-screen{padding:14px}
     .auth-card{padding:24px 20px;border-radius:14px}
     /* iOS auto-zooms inputs whose font-size is < 16px on focus. Bump to 16px
-       only on mobile so desktop layout is unaffected. */
-    input,select,textarea{font-size:16px}
+       on mobile (with !important so dynamically-rendered budget/tx inputs
+       that ship with inline styles still get the override). */
+    input,select,textarea{font-size:16px !important}
   }
   .pw-toggle{position:relative}
   .pw-toggle input{padding-right:42px}
