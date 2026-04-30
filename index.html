@@ -275,6 +275,9 @@
     #tx-table th:nth-child(6),#tx-table td:nth-child(6){display:none}
     .auth-screen{padding:14px}
     .auth-card{padding:24px 20px;border-radius:14px}
+    /* iOS auto-zooms inputs whose font-size is < 16px on focus. Bump to 16px
+       only on mobile so desktop layout is unaffected. */
+    input,select,textarea{font-size:16px}
   }
   .pw-toggle{position:relative}
   .pw-toggle input{padding-right:42px}
